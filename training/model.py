@@ -1,36 +1,45 @@
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
+
 import torch
 import torch.nn as nn
-from transformers import (
-        PreTrainedModel,
-        BertConfig,
-        BertModel,
-        )
-from typing import Iterable, List
-from dataclasses import dataclass
+from transformers import BertConfig, BertModel, PreTrainedModel
 
-@dataclass
-class MultiTaskClassfierOutput:
-    loss: Optional[torch.Tensor] = None
-    token_losses: Optional[List[torch.Tensor]] = None
-    sequence_losses: Optional[List[torch.Tensor]] = None
-    token_logits: List[torch.Tensor]
-    sequence_logits: List[torch.Tensor]
-    hidden_states: Optional[torch.Tensor] = None
-    attentions: Optional[torch.Tensor] = None
 
 class BertForMultiTaskClassification(PreTrainedModel):
-    def __init__(self, config: BertConfig, num_token_labels: Iterable[int], num_sequence_labels: Iterable[int], token_coefs: Iterable[float], sequence_coefs: Iterable[float]):
+    def __init__(
+        self,
+        model_id: str,
+        num_token_labels: int,
+        num_sequence_labels: int,
+        token_coef: float,
+        sequence_coef: float,
+        classifier_dropout: Optional[float] = None,
+    ):
+        config = BertConfig()
         super().__init__(config)
-        self.bert = BertModel(config)
+        self.bert = BertModel.from_pretrained(model_id)
         self.num_token_labels = num_token_labels
         self.num_sequence_labels = num_sequence_labels
-        self.token_classifiers = nn.ModuleList([nn.Linear(config.hidden_size, num_labels) for num_labels in num_token_labels])
-        self.sequence_classifiers = nn.ModuleList([nn.Linear(config.hidden_size, num_labels) for num_labels in num_sequence_labels])
-        dropout_prob = config.classifier_dropout if config.classifier_dropout is not None else 0.
+        self.token_classifier = nn.Linear(config.hidden_size, self.num_token_labels)
+        self.sequence_classifier = nn.Linear(config.hidden_size, self.num_sequence_labels)
+        dropout_prob = classifier_dropout if classifier_dropout is not None else 0.0
         self.dropout = nn.Dropout(dropout_prob)
         self.loss_fn = nn.CrossEntropyLoss()
+        self.token_coef = token_coef
+        self.sequence_coef = sequence_coef
 
-    def forward(input_ids: Optional = None, attention_mask: Optional = None, token_type_ids: Optional = None, position_ids: Optional = None, head_mask: Optional = None, inputs_embeds: Optional = None, token_labels: Optional = None, sequence_labels: Optional = None, output_attentions: Optional = None, output_hidden_states: Optional = None,) -> SequenceClassifierOutput:
+    def forward(
+        self,
+        input_ids: Optional = None,
+        attention_mask: Optional = None,
+        token_type_ids: Optional = None,
+        position_ids: Optional = None,
+        head_mask: Optional = None,
+        inputs_embeds: Optional = None,
+        token_labels: Optional = None,
+        sequence_labels: Optional = None,
+    ) -> dict:
         outputs = self.bert(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -38,33 +47,31 @@ class BertForMultiTaskClassification(PreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             return_dict=True,
         )
         # Token classification
-        token_logits = [classifier(self.dropout(outputs.last_hidden_state)) for classifier in self.token_classifiers]
+        token_logits = self.token_classifier(self.dropout(outputs.last_hidden_state))
         loss = None
         if token_labels is not None:
-            token_losses = [self.loss_fn(logit, label) for logit, label in zip(token_logits, token_labels)]
-            token_loss = sum([coef * loss for coef, loss in zip(self.token_coefs, token_losses)])
-            loss = token_loss
+            transposed_logits = token_logits.transpose(-2, -1)
+            token_loss = self.loss_fn(transposed_logits, token_labels)
+            loss = token_loss * self.token_coef
 
         # Sequence classification
-        sequence_logits = [classifier(self.dropout(outputs.pooler_output)) for classifier in self.sequence_classifiers]
+        sequence_logits = self.sequence_classifier(self.dropout(outputs.pooler_output))
         if sequence_labels is not None:
-            sequence_losses = [self.loss_fn(logit, label) for logit, label in zip(sequence_logits, sequence_labels)]
-            sequence_loss = sum([coef * loss for coef, loss in zip(self.sequence_coefs, sequence_losses)])
-            loss = loss + sequence_loss if loss is not None else sequence_loss
+            sequence_loss = self.loss_fn(sequence_logits, sequence_labels)
+            loss = loss + sequence_loss * self.sequence_coef if loss is not None else sequence_loss
 
-        return MultiTaskClassfierOutput(
-            loss=loss,
-            token_losses=token_losses,
-            sequence_losses=sequence_losses,
-            token_logits=token_logits,
-            sequence_logits=sequence_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        assert loss.ndim == 0, f"Loss must be a scalar, got {loss.ndim} dimensions"
 
+        # Full logits
+        logits = {"token_logits": token_logits, "sequence_logits": sequence_logits}
 
+        output = {}
+        output["logits"] = logits
+        output["loss"] = loss
+        output["token_loss"] = token_loss
+        output["sequence_loss"] = sequence_loss
+
+        return output

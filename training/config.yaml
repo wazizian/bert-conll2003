@@ -1,0 +1,16 @@
+model_id: "google-bert/bert-base-cased"
+
+dataset_path: "../data/conll2003-tokenized"
+token_coef: 1.0
+num_token_labels: 9
+sequence_coef: 0.0
+num_sequence_labels: 5
+
+num_epochs: 10
+batch_size: 32
+weight_decay: 0.01
+n_train: 10
+classifier_dropout: 0.1
+
+seed: 0
+output_dir: "bert_ner"

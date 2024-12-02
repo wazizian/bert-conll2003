@@ -1,114 +1,151 @@
-# Code adapted from https://github.com/huggingface/trl/blob/main/examples/research_projects/stack_llama/scripts/supervised_finetuning.py
-# and https://huggingface.co/blog/gemma-peft
-import multiprocessing
 import os
-import hydra
 
+os.environ["WANDB_PROJECT"] = "bert-mt-classif"
+
+import math
+
+import hydra
+import numpy as np
 import torch
-import transformers
-from accelerate import PartialState
-from datasets import Dataset
-from peft import AutoPeftModelForCausalLM, LoraConfig
+import torch.nn.functional as F
+from datasets import DatasetDict
+from model import BertForMultiTaskClassification
 from transformers import (
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    is_torch_npu_available,
-    is_torch_xpu_available,
-    logging,
+    AutoTokenizer,
+    DataCollatorForTokenClassification,
+    Trainer,
+    TrainingArguments,
     set_seed,
 )
-from trl import SFTTrainer
+from transformers.data.data_collator import DataCollatorMixin
+
+
+def prepare_data(cfg):
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
+    processed_dataset = DatasetDict.load_from_disk(cfg.dataset_path)
+    train_dataset = processed_dataset["train"].shuffle(seed=cfg.seed).select(range(cfg.n_train))
+    val_dataset = processed_dataset["validation"]
+    test_dataset = processed_dataset["test"]
+
+    return train_dataset, val_dataset, test_dataset
+
+
+class DataCollator(DataCollatorMixin):
+    def __init__(self, tokenizer):
+        self._collator = DataCollatorForTokenClassification(tokenizer)
+        self.return_tensors = "pt"
+
+    def torch_call(self, features):
+        _features = [
+            {k: v for (k, v) in feature.items() if k != "sequence_labels"} for feature in features
+        ]
+        for feature in _features:
+            feature["label"] = feature.pop("token_labels")
+        _collated = self._collator(_features)
+        _collated["sequence_labels"] = torch.tensor(
+            [feature["sequence_labels"] for feature in features]
+        )
+        _collated["token_labels"] = _collated.pop("label")
+        return _collated
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+
+    tokens_logits = logits[0]["token_logits"]
+    sequence_logits = logits[0]["sequence_logits"]
+
+    token_labels = labels[0]
+    sequence_labels = labels[1]
+
+    token_predictions = np.argmax(tokens_logits, axis=-1)
+    sequence_predictions = np.argmax(sequence_logits, axis=-1)
+
+    cleaned_token_predictions = [
+        token_predictions[i][token_labels[i] != -100] for i in range(len(token_predictions))
+    ]
+    cleaned_token_labels = [
+        token_labels[i][token_labels[i] != -100] for i in range(len(token_labels))
+    ]
+
+    token_accuracies = [
+        np.mean(cleaned_token_predictions[i] == cleaned_token_labels[i])
+        for i in range(len(cleaned_token_predictions))
+    ]
+    token_accuracy = np.mean(token_accuracies)
+
+    sequence_accuracy = np.mean(sequence_predictions == sequence_labels)
+
+    transposed_logits = torch.tensor(tokens_logits).transpose(-2, -1)
+    token_loss = F.cross_entropy(transposed_logits, torch.tensor(token_labels))
+    sequence_loss = F.cross_entropy(torch.tensor(sequence_logits), torch.tensor(sequence_labels))
+
+    return {
+        "token_accuracy": token_accuracy,
+        "sequence_accuracy": sequence_accuracy,
+        "token_loss": token_loss,
+        "sequence_loss": sequence_loss,
+    }
+
 
 def train(cfg):
-    bnb_config = None
-    if cfg.use_bnb:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id,
-        quantization_config=bnb_config,
-        device_map={"": PartialState().process_index},
-        attention_dropout=cfg.attention_dropout,
+    print("Config:")
+    for k, v in cfg.items():
+        print(f"{k}: {v}")
+    model = BertForMultiTaskClassification(
+        model_id=cfg.model_id,
+        num_token_labels=cfg.num_token_labels,
+        num_sequence_labels=cfg.num_sequence_labels,
+        token_coef=cfg.token_coef,
+        sequence_coef=cfg.sequence_coef,
+        classifier_dropout=cfg.classifier_dropout,
     )
+
+    train_dataset, val_dataset, test_dataset = prepare_data(cfg)
+
+    run_name = f"{cfg.token_coef=}-{cfg.sequence_coef=}-{cfg.n_train}"
+    args = TrainingArguments(
+        per_device_train_batch_size=cfg.batch_size,
+        num_train_epochs=cfg.num_epochs,
+        logging_strategy="steps",
+        logging_steps=1,
+        output_dir=cfg.output_dir + f"/{run_name}",
+        seed=cfg.seed,
+        run_name=run_name,
+        report_to="wandb",
+        label_names=["token_labels", "sequence_labels"],
+        eval_strategy="epoch",
+        eval_on_start=True,
+        weight_decay=cfg.weight_decay,
+    )
+
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
 
-    dataset = Dataset.load_from_disk(cfg.dataset_path)
-    tokenized_dataset = dataset.map(lambda examples: tokenizer(examples[cfg.dataset_text_field], truncation=True, padding="max_length"), batched=True)
-
-    train_dataset = tokenized_dataset["train"]
-    test_dataset = tokenized_dataset["test"]
-   
-    if cfg.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-
-
-
-    trainer = SFTTrainer(
+    trainer = Trainer(
         model=model,
-        train_dataset=data,
-        max_seq_length=cfg.max_seq_length,
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=cfg.micro_batch_size,
-            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-            gradient_checkpointing=cfg.gradient_checkpointing,
-            warmup_steps=cfg.warmup_steps,
-            max_steps=cfg.max_steps,
-            learning_rate=cfg.learning_rate,
-            lr_scheduler_type=cfg.lr_scheduler_type,
-            weight_decay=cfg.weight_decay,
-            bf16=cfg.bf16,
-            logging_strategy="steps",
-            logging_steps=10,
-            output_dir=cfg.output_dir,
-            optim="paged_adamw_8bit",
-            seed=cfg.seed,
-            run_name=f"train-{cfg.model_id.split('/')[-1]}",
-            report_to="wandb",
-        ),
-        peft_config=lora_config,
-        dataset_text_field=cfg.dataset_text_field,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=DataCollator(tokenizer),
+        compute_metrics=compute_metrics,
     )
 
     # launch
     print("Training...")
     trainer.train()
-
-    print("Saving the last checkpoint of the model")
-    trainer.save_model(os.path.join(cfg.output_dir, "final_checkpoint/"))
-    # model.save_pretrained(os.path.join(cfg.output_dir, "final_checkpoint/"))
-
-    if cfg.save_merged_model:
-        # Free memory for merging weights
-        del model
-        if is_torch_xpu_available():
-            torch.xpu.empty_cache()
-        elif is_torch_npu_available():
-            torch.npu.empty_cache()
-        else:
-            torch.cuda.empty_cache()
-
-        output_final_dir = os.path.join(cfg.output_dir, "final_checkpoint/")
-        model = AutoPeftModelForCausalLM.from_pretrained(output_final_dir, device_map="auto", torch_dtype=torch.bfloat16)
-        model = model.merge_and_unload()
-
-        output_merged_dir = os.path.join(cfg.output_dir, "final_merged_checkpoint")
-        model.save_pretrained(output_merged_dir, safe_serialization=True)
-
-        if cfg.push_to_hub:
-            model.push_to_hub(cfg.repo_id, "Upload model")
-    
     print("Training Done! 💥")
+    print("Testing...")
+    trainer.evaluate(test_dataset, metric_key_prefix="test")
+    print("Testing Done! 💥")
+    return
 
-@hydra.main(config_path="configs", config_name="config", version_base=None)
+
+@hydra.main(config_path="./", config_name="config", version_base=None)
 def main(cfg):
     set_seed(cfg.seed)
     os.makedirs(cfg.output_dir, exist_ok=True)
-    logging.set_verbosity_error()
     train(cfg)
+
 
 if __name__ == "__main__":
     main()
